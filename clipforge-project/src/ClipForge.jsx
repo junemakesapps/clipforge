@@ -950,6 +950,10 @@ export default function ClipForge() {
   const [showFFmpeg, setShowFFmpeg] = useState(false);
   const fileRef = useRef(null);
   const videoRef = useRef(null);
+  const previewRef = useRef(null);
+  const ytPlayerRef = useRef(null);
+  const [activeClipIdx, setActiveClipIdx] = useState(-1);
+  const [isPlaying, setIsPlaying] = useState(false);
 
   const FREE_LIMIT = 3;
   const isLimited = plan === "free" && usageCount >= FREE_LIMIT;
@@ -1272,6 +1276,132 @@ export default function ClipForge() {
         {/* ===== STEP 3: RESULTS ===== */}
         {step === 3 && (
           <div style={{ animation: "fadeUp 0.5s ease-out" }}>
+
+            {/* Clip Preview Player */}
+            <TiltCard style={{ padding: 24, marginBottom: 24 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 14 }}>
+                <span style={{ fontSize: 20 }}>🎬</span>
+                <h3 style={{ fontSize: 18, fontWeight: 700, margin: 0, letterSpacing: "-0.3px" }}>Clip Preview</h3>
+                <span style={{
+                  fontSize: 11, color: T.textDim, background: "rgba(160,160,255,0.06)",
+                  padding: "3px 8px", borderRadius: 5, fontFamily: "'JetBrains Mono', monospace",
+                }}>
+                  {selectedClips.length} clip{selectedClips.length !== 1 ? "s" : ""} · {formatTime(totalClipDuration)}
+                </span>
+              </div>
+
+              {/* Video player */}
+              <div style={{ borderRadius: 12, overflow: "hidden", aspectRatio: "16/9", marginBottom: 16, background: "rgba(17,17,24,0.8)", boxShadow: "0 4px 24px rgba(0,0,0,0.4)", position: "relative" }}>
+                {videoSource === "youtube" && youtubeId ? (
+                  <iframe
+                    ref={previewRef}
+                    id="ytPreviewPlayer"
+                    width="100%" height="100%"
+                    src={`https://www.youtube.com/embed/${youtubeId}?enablejsapi=1&origin=${typeof window !== 'undefined' ? window.location.origin : ''}`}
+                    frameBorder="0" allowFullScreen
+                    allow="autoplay"
+                    style={{ borderRadius: 12 }}
+                  />
+                ) : videoUrl ? (
+                  <video ref={previewRef} src={videoUrl} style={{ width: "100%", height: "100%", borderRadius: 12 }} controls />
+                ) : (
+                  <div style={{ width: "100%", height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontSize: 14 }}>
+                    No video source available
+                  </div>
+                )}
+
+                {/* Active clip overlay label */}
+                {activeClipIdx >= 0 && activeClipIdx < selectedClips.length && (
+                  <div style={{
+                    position: "absolute", top: 12, left: 12,
+                    background: "rgba(0,0,0,0.7)", backdropFilter: "blur(8px)",
+                    padding: "6px 12px", borderRadius: 8,
+                    display: "flex", alignItems: "center", gap: 6,
+                    animation: "fadeIn 0.2s ease-out",
+                  }}>
+                    <span style={{
+                      width: 8, height: 8, borderRadius: "50%",
+                      background: isPlaying ? "#00E5A0" : "#6E6E85",
+                      boxShadow: isPlaying ? "0 0 8px rgba(0,229,160,0.5)" : "none",
+                    }} />
+                    <span style={{ fontSize: 11, fontWeight: 600, color: T.text, fontFamily: "'JetBrains Mono', monospace" }}>
+                      Clip {activeClipIdx + 1}/{selectedClips.length}
+                    </span>
+                    <span style={{ fontSize: 11, color: T.textDim }}>
+                      {formatTime(selectedClips[activeClipIdx].start)} → {formatTime(selectedClips[activeClipIdx].end)}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* Clip selector buttons */}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                {selectedClips.map((clip, i) => {
+                  const cat = CATEGORIES[clip.category] || CATEGORIES.key_insight;
+                  const isActive = activeClipIdx === i;
+                  return (
+                    <button key={i} onClick={() => {
+                      setActiveClipIdx(i);
+                      setIsPlaying(true);
+                      if (videoSource === "youtube" && previewRef.current) {
+                        previewRef.current.contentWindow?.postMessage(JSON.stringify({
+                          event: "command", func: "seekTo", args: [clip.start, true]
+                        }), "*");
+                        previewRef.current.contentWindow?.postMessage(JSON.stringify({
+                          event: "command", func: "playVideo"
+                        }), "*");
+                      } else if (previewRef.current && previewRef.current.tagName === "VIDEO") {
+                        previewRef.current.currentTime = clip.start;
+                        previewRef.current.play();
+                      }
+                    }} style={{
+                      padding: "8px 14px", borderRadius: 8, cursor: "pointer",
+                      border: `1.5px solid ${isActive ? cat.color + "80" : "rgba(160,160,255,0.1)"}`,
+                      background: isActive ? cat.color + "18" : "rgba(26,26,36,0.6)",
+                      display: "flex", alignItems: "center", gap: 8,
+                      transition: "all 0.2s ease",
+                      fontFamily: "'Outfit', sans-serif",
+                    }}>
+                      <span style={{ fontSize: 12 }}>{cat.icon}</span>
+                      <span style={{
+                        fontSize: 12, fontWeight: 600,
+                        color: isActive ? cat.color : T.textMid,
+                      }}>Clip {i + 1}</span>
+                      <span style={{
+                        fontSize: 10, fontFamily: "'JetBrains Mono', monospace",
+                        color: isActive ? T.text : T.textDim,
+                      }}>{formatTime(clip.start)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Play all button */}
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button className="btn-primary" style={{ padding: "8px 18px", fontSize: 13 }} onClick={() => {
+                  if (selectedClips.length === 0) return;
+                  setActiveClipIdx(0);
+                  setIsPlaying(true);
+                  const clip = selectedClips[0];
+                  if (videoSource === "youtube" && previewRef.current) {
+                    previewRef.current.contentWindow?.postMessage(JSON.stringify({
+                      event: "command", func: "seekTo", args: [clip.start, true]
+                    }), "*");
+                    previewRef.current.contentWindow?.postMessage(JSON.stringify({
+                      event: "command", func: "playVideo"
+                    }), "*");
+                  } else if (previewRef.current && previewRef.current.tagName === "VIDEO") {
+                    previewRef.current.currentTime = clip.start;
+                    previewRef.current.play();
+                  }
+                }} disabled={selectedClips.length === 0}>
+                  ▶ Play All Clips
+                </button>
+                <span style={{ fontSize: 12, color: T.textDim }}>
+                  Click a clip to preview it, or play all in sequence
+                </span>
+              </div>
+            </TiltCard>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
               <div>
                 <h2 style={{ fontSize: 28, fontWeight: 800, marginBottom: 4, letterSpacing: "-0.5px" }}>
