@@ -14,7 +14,11 @@ export default async function handler(req, res) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
   if (!apiKey) {
-    return res.status(500).json({ error: "API key not configured. Add ANTHROPIC_API_KEY in Vercel environment variables." });
+    // Debug: list which env vars exist (without showing values)
+    const envKeys = Object.keys(process.env).filter(k => k.includes("ANTHRO") || k.includes("anthro"));
+    return res.status(500).json({ 
+      error: `API key not configured. Found env vars matching 'ANTHRO': [${envKeys.join(', ')}]. Make sure the variable is named exactly ANTHROPIC_API_KEY with no extra spaces.`
+    });
   }
 
   try {
@@ -56,12 +60,12 @@ ${transcript}`,
 
     if (!response.ok) {
       return res.status(response.status).json({
-        error: data.error?.message || "API request failed",
+        error: `Anthropic API error (${response.status}): ${data.error?.message || JSON.stringify(data)}`,
       });
     }
 
     return res.status(200).json(data);
   } catch (err) {
-    return res.status(500).json({ error: err.message || "Server error" });
+    return res.status(500).json({ error: `Server error: ${err.message}` });
   }
 }
