@@ -1,6 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { toBlobURL, fetchFile } from "@ffmpeg/util";
+import { useState, useRef, useEffect } from "react";
 
 // --- Design Tokens ---
 const T = {
@@ -940,9 +938,6 @@ export default function ClipForge() {
     try { return parseInt(window.sessionStorage?.getItem("cf_usage") || "0"); } catch { return 0; }
   });
   const [plan, setPlan] = useState("free"); // "free" | "pro" | "lifetime"
-  const [transcribeUsage, setTranscribeUsage] = useState(() => {
-    try { return parseInt(window.sessionStorage?.getItem("cf_transcribe_usage") || "0"); } catch { return 0; }
-  });
   const [videoSource, setVideoSource] = useState("");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [videoFile, setVideoFile] = useState(null);
@@ -959,309 +954,6 @@ export default function ClipForge() {
   const ytPlayerRef = useRef(null);
   const [activeClipIdx, setActiveClipIdx] = useState(-1);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [compiling, setCompiling] = useState(false);
-  const [compileProgress, setCompileProgress] = useState("");
-  const [compiledUrl, setCompiledUrl] = useState(null);
-  const [transition, setTransition] = useState("fade");
-  const [transcribing, setTranscribing] = useState(false);
-  const [transcribeProgress, setTranscribeProgress] = useState("");
-  const [aspectRatio, setAspectRatio] = useState("16:9"); // "16:9" | "9:16" | "1:1"
-  const [captionsEnabled, setCaptionsEnabled] = useState(false);
-  const [captionStyle, setCaptionStyle] = useState("bold");
-  const ffmpegRef = useRef(null);
-
-  const TRANSITIONS = {
-    none: { label: "Hard Cut", icon: "✂️", desc: "Instant cut between clips", ffmpeg: null },
-    fade: { label: "Fade to Black", icon: "🌑", desc: "Classic dip to black", ffmpeg: "fadeblack" },
-    dissolve: { label: "Dissolve", icon: "✨", desc: "Smooth blend between clips", ffmpeg: "dissolve" },
-    wipeleft: { label: "Swipe Left", icon: "👈", desc: "Fast swipe transition", ffmpeg: "wipeleft" },
-    wiperight: { label: "Swipe Right", icon: "👉", desc: "Fast swipe the other way", ffmpeg: "wiperight" },
-    wipeup: { label: "Swipe Up", icon: "👆", desc: "Vertical swipe up", ffmpeg: "wipeup" },
-    slideright: { label: "Slide Push", icon: "📱", desc: "Push slide like stories", ffmpeg: "slideright" },
-    circleclose: { label: "Iris Close", icon: "🔵", desc: "Circle wipe like retro film", ffmpeg: "circleclose" },
-    diagtr: { label: "Diagonal", icon: "📐", desc: "Diagonal wipe", ffmpeg: "diagtr" },
-    pixelize: { label: "Pixelate", icon: "🟩", desc: "Pixel dissolve effect", ffmpeg: "pixelize" },
-  };
-
-  const CAPTION_STYLES = {
-    bold: { label: "Bold", icon: "🅱️", desc: "Large bold text, dark box", fontsize: 42, boxEnabled: true, fontcolor: "white", boxcolor: "black@0.65", borderw: 0, y: "h-th-60" },
-    classic: { label: "Classic", icon: "📺", desc: "White text, black outline", fontsize: 36, boxEnabled: false, fontcolor: "white", boxcolor: "", borderw: 3, y: "h-th-50" },
-    minimal: { label: "Minimal", icon: "✦", desc: "Small subtle text", fontsize: 28, boxEnabled: false, fontcolor: "white@0.9", boxcolor: "", borderw: 2, y: "h-th-40" },
-    top: { label: "Top Bar", icon: "⬆️", desc: "Text at top of frame", fontsize: 36, boxEnabled: true, fontcolor: "white", boxcolor: "black@0.65", borderw: 0, y: "30" },
-    center: { label: "Center", icon: "🎯", desc: "Big centered text", fontsize: 48, boxEnabled: true, fontcolor: "white", boxcolor: "black@0.5", borderw: 0, y: "(h-th)/2" },
-  };
-
-  const ASPECT_RATIOS = {
-    "16:9": { label: "16:9", icon: "🖥️", desc: "Landscape (YouTube)", w: 1920, h: 1080 },
-    "9:16": { label: "9:16", icon: "📱", desc: "Vertical (TikTok/Reels)", w: 1080, h: 1920 },
-    "1:1": { label: "1:1", icon: "⬜", desc: "Square (Instagram)", w: 1080, h: 1080 },
-  };
-
-  // Helper for base64 encoding large buffers
-  const arrayBufferToBase64 = (buffer) => {
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    const chunkSize = 8192;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
-      binary += String.fromCharCode.apply(null, chunk);
-    }
-    return btoa(binary);
-  };
-
-  // Helper to load FFmpeg
-  const loadFFmpeg = async () => {
-    if (!ffmpegRef.current) {
-      const ffmpeg = new FFmpeg();
-      ffmpeg.on("progress", ({ progress }) => {
-        if (compiling) setCompileProgress(`Processing... ${Math.round(progress * 100)}%`);
-      });
-      const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-      });
-      ffmpegRef.current = ffmpeg;
-    }
-    return ffmpegRef.current;
-  };
-
-  // ========== AUTO-TRANSCRIPTION ==========
-  const FREE_TRANSCRIBE_LIMIT = 1;
-  const isTranscribeLimited = plan === "free" && transcribeUsage >= FREE_TRANSCRIBE_LIMIT;
-
-  const autoTranscribe = useCallback(async () => {
-    if (!videoFile) return;
-    if (isTranscribeLimited) { setShowPricing(true); return; }
-    setTranscribing(true);
-    setTranscribeProgress("Loading video processor...");
-    setError("");
-
-    try {
-      const ffmpeg = await loadFFmpeg();
-      setTranscribeProgress("Extracting audio from video...");
-
-      const fileData = await fetchFile(videoFile);
-      await ffmpeg.writeFile("input_av", fileData);
-
-      // Extract audio as low-bitrate mono MP3 for speech recognition
-      await ffmpeg.exec([
-        "-i", "input_av", "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-f", "mp3", "audio_full.mp3",
-      ]);
-
-      const audioData = await ffmpeg.readFile("audio_full.mp3");
-      const audioSize = audioData.length;
-
-      // Clean up video input
-      try { await ffmpeg.deleteFile("input_av"); } catch {}
-
-      // Split into chunks if needed (max ~2MB per chunk for Vercel body limit)
-      const MAX_CHUNK_BYTES = 2 * 1024 * 1024;
-      const CHUNK_SECS = 600; // 10 min chunks
-      const estDuration = estimatedDuration || 600;
-      const numChunks = audioSize > MAX_CHUNK_BYTES ? Math.ceil(estDuration / CHUNK_SECS) : 1;
-
-      let allSegments = [];
-      let fullText = "";
-
-      if (numChunks <= 1) {
-        // Single request
-        setTranscribeProgress("Transcribing audio with AI...");
-        const base64 = arrayBufferToBase64(audioData.buffer);
-        const resp = await fetch("/api/transcribe", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ audio: base64, offset: 0 }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || "Transcription failed");
-        if (data.segments) allSegments = data.segments;
-        fullText = data.text || "";
-      } else {
-        // Split audio into time-based chunks
-        for (let i = 0; i < numChunks; i++) {
-          const startSec = i * CHUNK_SECS;
-          const chunkName = `chunk_${i}.mp3`;
-          setTranscribeProgress(`Preparing chunk ${i + 1} of ${numChunks}...`);
-
-          await ffmpeg.exec([
-            "-i", "audio_full.mp3", "-ss", String(startSec), "-t", String(CHUNK_SECS), "-c", "copy", chunkName,
-          ]);
-
-          const chunkData = await ffmpeg.readFile(chunkName);
-          const base64 = arrayBufferToBase64(chunkData.buffer);
-
-          setTranscribeProgress(`Transcribing chunk ${i + 1} of ${numChunks}...`);
-          const resp = await fetch("/api/transcribe", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ audio: base64, offset: startSec }),
-          });
-          const data = await resp.json();
-          if (!resp.ok) throw new Error(data.error || `Transcription failed for chunk ${i + 1}`);
-
-          if (data.segments) allSegments.push(...data.segments);
-          fullText += (fullText ? " " : "") + (data.text || "");
-
-          try { await ffmpeg.deleteFile(chunkName); } catch {}
-        }
-      }
-
-      try { await ffmpeg.deleteFile("audio_full.mp3"); } catch {}
-
-      // Format transcript with timestamps
-      const formattedTranscript = allSegments.length > 0
-        ? allSegments.map((s) => `${formatTime(Math.round(s.start))} ${s.text.trim()}`).join("\n")
-        : fullText;
-
-      setTranscript(formattedTranscript);
-      setTranscribeProgress("");
-
-      // Track usage
-      const newCount = transcribeUsage + 1;
-      setTranscribeUsage(newCount);
-      try { window.sessionStorage?.setItem("cf_transcribe_usage", String(newCount)); } catch {}
-
-
-    } catch (err) {
-      console.error("Transcription error:", err);
-      setError(`Transcription error: ${err.message}`);
-      setTranscribeProgress("");
-    } finally {
-      setTranscribing(false);
-    }
-  }, [videoFile, estimatedDuration, isTranscribeLimited, transcribeUsage]);
-
-  // ========== VIDEO COMPILATION ==========
-  const compileVideo = useCallback(async () => {
-    if (selectedClips.length === 0 || !videoFile) return;
-    setCompiling(true);
-    setCompileProgress("Loading video processor...");
-    setCompiledUrl(null);
-
-    try {
-      const ffmpeg = await loadFFmpeg();
-      setCompileProgress("Loading video file...");
-      const fileData = await fetchFile(videoFile);
-      await ffmpeg.writeFile("input.mp4", fileData);
-
-      const transType = TRANSITIONS[transition]?.ffmpeg;
-      const transDuration = 0.5;
-      const ar = ASPECT_RATIOS[aspectRatio];
-      const needsCrop = aspectRatio !== "16:9";
-      const needsReencode = transType || needsCrop || captionsEnabled;
-      const capStyle = CAPTION_STYLES[captionStyle] || CAPTION_STYLES.bold;
-
-      // Build video filter for crop/aspect ratio
-      let cropFilter = "";
-      if (aspectRatio === "9:16") {
-        cropFilter = "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920";
-      } else if (aspectRatio === "1:1") {
-        cropFilter = "crop=min(iw\\,ih):min(iw\\,ih):(iw-min(iw\\,ih))/2:(ih-min(iw\\,ih))/2,scale=1080:1080";
-      } else {
-        cropFilter = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2";
-      }
-
-      // Extract each clip
-      const clipFiles = [];
-      const clipDurations = [];
-      for (let i = 0; i < selectedClips.length; i++) {
-        const clip = selectedClips[i];
-        const clipName = `clip_${String(i).padStart(3, "0")}.mp4`;
-        const dur = clip.end - clip.start;
-        clipDurations.push(dur);
-        setCompileProgress(`Cutting clip ${i + 1} of ${selectedClips.length}...`);
-
-        if (needsReencode) {
-          // Build filter chain
-          let filters = [cropFilter];
-
-          // Add caption overlay
-          if (captionsEnabled && clip.quote) {
-            const safeText = (clip.quote || clip.reason || "").replace(/'/g, "\u2019").replace(/:/g, "\\:").replace(/\\/g, "").substring(0, 80);
-            let drawtext = `drawtext=text='${safeText}':fontsize=${capStyle.fontsize}:fontcolor=${capStyle.fontcolor}:borderw=${capStyle.borderw}:bordercolor=black:x=(w-text_w)/2:y=${capStyle.y}`;
-            if (capStyle.boxEnabled) {
-              drawtext += `:box=1:boxcolor=${capStyle.boxcolor}:boxborderw=12`;
-            }
-            filters.push(drawtext);
-          }
-
-          await ffmpeg.exec([
-            "-i", "input.mp4",
-            "-ss", String(clip.start),
-            "-to", String(clip.end),
-            "-vf", filters.join(","),
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "23",
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-pix_fmt", "yuv420p",
-            "-avoid_negative_ts", "make_zero",
-            clipName,
-          ]);
-        } else {
-          await ffmpeg.exec([
-            "-i", "input.mp4",
-            "-ss", String(clip.start),
-            "-to", String(clip.end),
-            "-c", "copy",
-            "-avoid_negative_ts", "make_zero",
-            clipName,
-          ]);
-        }
-        clipFiles.push(clipName);
-      }
-
-      if (!transType || selectedClips.length === 1) {
-        // Simple concat
-        setCompileProgress("Merging clips...");
-        const concatList = clipFiles.map((f) => `file '${f}'`).join("\n");
-        await ffmpeg.writeFile("concat.txt", new TextEncoder().encode(concatList));
-        await ffmpeg.exec(["-f", "concat", "-safe", "0", "-i", "concat.txt", "-c", "copy", "compilation.mp4"]);
-        await ffmpeg.deleteFile("concat.txt");
-      } else {
-        // Apply xfade transitions
-        setCompileProgress("Applying transitions...");
-        let currentInput = clipFiles[0];
-        let currentDuration = clipDurations[0];
-
-        for (let i = 1; i < clipFiles.length; i++) {
-          const outputName = i === clipFiles.length - 1 ? "compilation.mp4" : `merged_${i}.mp4`;
-          const offset = Math.max(0, currentDuration - transDuration);
-
-          setCompileProgress(`Applying transition ${i} of ${clipFiles.length - 1}...`);
-          await ffmpeg.exec([
-            "-i", currentInput, "-i", clipFiles[i],
-            "-filter_complex",
-            `[0:v][1:v]xfade=transition=${transType}:duration=${transDuration}:offset=${offset}[v];[0:a][1:a]acrossfade=d=${transDuration}[a]`,
-            "-map", "[v]", "-map", "[a]",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-            "-c:a", "aac", "-pix_fmt", "yuv420p",
-            outputName,
-          ]);
-
-          if (i > 1) { try { await ffmpeg.deleteFile(currentInput); } catch {} }
-          currentInput = outputName;
-          currentDuration = currentDuration + clipDurations[i] - transDuration;
-        }
-      }
-
-      const data = await ffmpeg.readFile("compilation.mp4");
-      const blob = new Blob([data.buffer], { type: "video/mp4" });
-      const url = URL.createObjectURL(blob);
-      setCompiledUrl(url);
-      setCompileProgress("Done!");
-
-      try { await ffmpeg.deleteFile("input.mp4"); } catch {}
-      for (const f of clipFiles) { try { await ffmpeg.deleteFile(f); } catch {} }
-    } catch (err) {
-      console.error("Compilation error:", err);
-      setCompileProgress(`Error: ${err.message}`);
-    } finally {
-      setCompiling(false);
-    }
-  }, [selectedClips, videoFile, transition, aspectRatio, captionsEnabled, captionStyle]);
 
   const FREE_LIMIT = 3;
   const isLimited = plan === "free" && usageCount >= FREE_LIMIT;
@@ -1333,102 +1025,6 @@ export default function ClipForge() {
     return selectedClips.map((c, i) => `ffmpeg -i "${fn}" -ss ${c.start} -to ${c.end} -c copy "clip_${String(i + 1).padStart(2, "0")}.mp4"`).join("\n");
   };
 
-  const downloadFile = (content, filename, type) => {
-    const blob = new Blob([content], { type });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const exportCSV = () => {
-    const header = "Clip #,Start,End,Duration,Category,Reason,Quote";
-    const rows = selectedClips.map((c, i) =>
-      `${i + 1},"${formatTime(c.start)}","${formatTime(c.end)}","${formatTime(c.end - c.start)}","${CATEGORIES[c.category]?.label || c.category}","${(c.reason || "").replace(/"/g, '""')}","${(c.quote || "").replace(/"/g, '""')}"`
-    );
-    downloadFile([header, ...rows].join("\n"), "clipforge-clips.csv", "text/csv");
-  };
-
-  const exportSRT = () => {
-    const srt = selectedClips.map((c, i) => {
-      const toSRT = (s) => {
-        const h = Math.floor(s / 3600);
-        const m = Math.floor((s % 3600) / 60);
-        const sec = Math.floor(s % 60);
-        const ms = Math.round((s % 1) * 1000);
-        return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")},${String(ms).padStart(3,"0")}`;
-      };
-      return `${i + 1}\n${toSRT(c.start)} --> ${toSRT(c.end)}\n${c.quote || c.reason || `Clip ${i + 1}`}\n`;
-    }).join("\n");
-    downloadFile(srt, "clipforge-clips.srt", "text/srt");
-  };
-
-  const exportTXT = () => {
-    const src = videoSource === "youtube" ? youtubeUrl : videoFile?.name || "video";
-    const header = `ClipForge Export — ${new Date().toLocaleDateString()}\nSource: ${src}\nTotal Duration: ${formatTime(estimatedDuration)}\nClips: ${selectedClips.length} selected (${formatTime(totalClipDuration)} total)\n${"─".repeat(50)}\n`;
-    const body = selectedClips.map((c, i) =>
-      `\nClip ${i + 1} — ${CATEGORIES[c.category]?.label || c.category}\n  Time: ${formatTime(c.start)} → ${formatTime(c.end)} (${formatTime(c.end - c.start)})\n  Why:  ${c.reason || "N/A"}\n  Quote: "${c.quote || "N/A"}"`
-    ).join("\n");
-    downloadFile(header + body, "clipforge-clips.txt", "text/plain");
-  };
-
-  const exportEDL = () => {
-    const fn = videoSource === "youtube" ? "input.mp4" : videoFile?.name || "input.mp4";
-    const header = `TITLE: ClipForge Export\nFCM: NON-DROP FRAME\n\n`;
-    const toTC = (s) => {
-      const h = Math.floor(s / 3600);
-      const m = Math.floor((s % 3600) / 60);
-      const sec = Math.floor(s % 60);
-      const fr = Math.round((s % 1) * 30);
-      return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}:${String(fr).padStart(2,"0")}`;
-    };
-    let recPos = 0;
-    const events = selectedClips.map((c, i) => {
-      const dur = c.end - c.start;
-      const line = `${String(i + 1).padStart(3,"0")}  001  V  C  ${toTC(c.start)} ${toTC(c.end)} ${toTC(recPos)} ${toTC(recPos + dur)}`;
-      recPos += dur;
-      return `${line}\n* FROM CLIP NAME: ${fn}\n* COMMENT: ${c.reason || `Clip ${i + 1}`}\n`;
-    }).join("\n");
-    downloadFile(header + events, "clipforge-clips.edl", "text/plain");
-  };
-
-  const exportXML = () => {
-    const fn = videoSource === "youtube" ? "input.mp4" : videoFile?.name || "input.mp4";
-    const fps = 30;
-    const toFrames = (s) => Math.round(s * fps);
-    const markers = selectedClips.map((c, i) =>
-      `    <marker>\n      <name>Clip ${i + 1} — ${CATEGORIES[c.category]?.label || c.category}</name>\n      <in>${toFrames(c.start)}</in>\n      <out>${toFrames(c.end)}</out>\n      <comment>${c.reason || ""}</comment>\n    </marker>`
-    ).join("\n");
-    const clips = selectedClips.map((c, i) =>
-      `      <clipitem id="clip-${i + 1}">\n        <name>Clip ${i + 1}</name>\n        <start>${toFrames(c.start)}</start>\n        <end>${toFrames(c.end)}</end>\n        <in>${toFrames(c.start)}</in>\n        <out>${toFrames(c.end)}</out>\n        <file id="file-1">\n          <name>${fn}</name>\n          <pathurl>${fn}</pathurl>\n        </file>\n      </clipitem>`
-    ).join("\n");
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE xmeml>\n<xmeml version="5">\n  <sequence>\n    <name>ClipForge Export</name>\n    <rate><timebase>${fps}</timebase></rate>\n${markers}\n    <media>\n      <video>\n        <track>\n${clips}\n        </track>\n      </video>\n    </media>\n  </sequence>\n</xmeml>`;
-    downloadFile(xml, "clipforge-clips.xml", "application/xml");
-  };
-
-  const exportMarkdown = () => {
-    const src = videoSource === "youtube" ? youtubeUrl : videoFile?.name || "video";
-    let md = `# ClipForge Export\n\n**Source:** ${src}  \n**Date:** ${new Date().toLocaleDateString()}  \n**Clips:** ${selectedClips.length} selected (${formatTime(totalClipDuration)} total)  \n\n---\n\n`;
-    md += `| # | Start | End | Duration | Category | Reason |\n|---|-------|-----|----------|----------|--------|\n`;
-    md += selectedClips.map((c, i) =>
-      `| ${i + 1} | ${formatTime(c.start)} | ${formatTime(c.end)} | ${formatTime(c.end - c.start)} | ${CATEGORIES[c.category]?.label || c.category} | ${c.reason || "—"} |`
-    ).join("\n");
-    md += `\n\n---\n\n### Quotes\n\n`;
-    md += selectedClips.filter(c => c.quote).map((c, i) =>
-      `> "${c.quote}" — *${formatTime(c.start)}*`
-    ).join("\n\n");
-    downloadFile(md, "clipforge-clips.md", "text/markdown");
-  };
-
-  const EXPORT_FORMATS = [
-    { id: "csv", icon: "📊", label: "CSV", desc: "Excel / Google Sheets", fn: exportCSV },
-    { id: "txt", icon: "📝", label: "Summary", desc: "Plain text report", fn: exportTXT },
-    { id: "srt", icon: "💬", label: "SRT", desc: "Subtitles / captions", fn: exportSRT },
-    { id: "edl", icon: "🎬", label: "EDL", desc: "Premiere / Resolve", fn: exportEDL },
-    { id: "xml", icon: "🎞️", label: "FCPXML", desc: "Final Cut / Premiere", fn: exportXML },
-    { id: "md", icon: "📑", label: "Markdown", desc: "Notion / blogs", fn: exportMarkdown },
-    { id: "json", icon: "{ }", label: "JSON", desc: "Developer / API", fn: exportClipData },
-  ];
-
   const F = "'Outfit', sans-serif";
 
   return (
@@ -1473,10 +1069,10 @@ export default function ClipForge() {
                 Clip the moments<br />that matter.
               </h1>
               <p style={{
-                fontSize: 16, color: T.textMid, maxWidth: 480, margin: "0 auto", lineHeight: 1.6,
+                fontSize: 16, color: T.textMid, maxWidth: 440, margin: "0 auto", lineHeight: 1.6,
                 fontWeight: 400,
               }}>
-                AI finds your best moments. Auto-transcribe, crop for TikTok, add captions, and export a ready-to-post compilation — all in your browser.
+                AI finds the most impactful moments in your video. You fine-tune. Export ready-to-use clips in seconds.
               </p>
             </div>
 
@@ -1561,166 +1157,15 @@ export default function ClipForge() {
               </TiltCard>
             </div>
 
-            {/* ===== FEATURES SHOWCASE ===== */}
-            <div style={{ marginTop: 48 }}>
-              <h2 style={{
-                fontSize: 24, fontWeight: 800, textAlign: "center", letterSpacing: "-0.5px",
-                marginBottom: 8,
-                background: `linear-gradient(135deg, ${T.text}, ${T.accent})`,
-                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent", backgroundClip: "text",
-              }}>Everything you need. One tool.</h2>
-              <p style={{ textAlign: "center", fontSize: 14, color: T.textDim, marginBottom: 28, maxWidth: 400, margin: "0 auto 28px" }}>
-                No more juggling 5 apps. Upload → Transcribe → Clip → Export.
-              </p>
-
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-                {/* Auto-Transcribe */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(0,229,160,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.1s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(0,229,160,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>🎤</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>Auto-Transcribe</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    Upload a video and get a full timestamped transcript automatically. No copy-pasting from other tools.
-                  </p>
-                  <div style={{
-                    marginTop: 12, display: "inline-block", fontSize: 10, fontWeight: 600,
-                    color: T.accent, background: "rgba(0,229,160,0.08)",
-                    padding: "3px 10px", borderRadius: 5, border: "1px solid rgba(0,229,160,0.1)",
-                  }}>Powered by Whisper AI</div>
-                </div>
-
-                {/* AI Clip Detection */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(140,120,255,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.2s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(140,120,255,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>🧠</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>AI Clip Detection</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    AI analyzes your transcript and finds the most shareable, engaging moments — hooks, insights, stories, and humor.
-                  </p>
-                  <div style={{
-                    marginTop: 12, display: "inline-block", fontSize: 10, fontWeight: 600,
-                    color: T.accentAlt, background: "rgba(140,120,255,0.08)",
-                    padding: "3px 10px", borderRadius: 5, border: "1px solid rgba(140,120,255,0.1)",
-                  }}>Powered by Claude AI</div>
-                </div>
-
-                {/* Vertical Crop */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(255,120,180,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.3s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(255,120,180,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>📱</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>Auto-Crop Vertical</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    One click to convert landscape video to 9:16 for TikTok, Reels & Shorts, or 1:1 for Instagram.
-                  </p>
-                  <div style={{ display: "flex", gap: 6, marginTop: 12 }}>
-                    {["9:16", "1:1", "16:9"].map((r) => (
-                      <span key={r} style={{
-                        fontSize: 10, fontWeight: 600, color: "#FF78B4",
-                        background: "rgba(255,120,180,0.08)", padding: "3px 8px", borderRadius: 5,
-                        border: "1px solid rgba(255,120,180,0.1)",
-                      }}>{r}</span>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Captions */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(255,200,60,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.4s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(255,200,60,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>💬</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>Burn-in Captions</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    Overlay styled captions onto your clips. Choose from 5 styles — bold, classic, minimal, top bar, or centered.
-                  </p>
-                  <div style={{
-                    marginTop: 12, display: "inline-block", fontSize: 10, fontWeight: 600,
-                    color: "#FFC83C", background: "rgba(255,200,60,0.08)",
-                    padding: "3px 10px", borderRadius: 5, border: "1px solid rgba(255,200,60,0.1)",
-                  }}>5 caption styles</div>
-                </div>
-
-                {/* Transitions */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(60,200,255,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.5s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(60,200,255,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>✨</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>Pro Transitions</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    Fade, dissolve, swipe, slide, iris, pixelate — 10 transition effects to make your compilations look polished.
-                  </p>
-                  <div style={{
-                    marginTop: 12, display: "inline-block", fontSize: 10, fontWeight: 600,
-                    color: "#3CC8FF", background: "rgba(60,200,255,0.08)",
-                    padding: "3px 10px", borderRadius: 5, border: "1px solid rgba(60,200,255,0.1)",
-                  }}>10 effects</div>
-                </div>
-
-                {/* MP4 Export */}
-                <div style={{
-                  background: "rgba(26,26,36,0.6)", border: "1px solid rgba(0,229,160,0.12)",
-                  borderRadius: 14, padding: 20, position: "relative", overflow: "hidden",
-                  animation: "fadeUp 0.5s ease-out 0.6s both",
-                }}>
-                  <div style={{
-                    position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
-                    background: "radial-gradient(circle, rgba(0,229,160,0.08), transparent)", pointerEvents: "none",
-                  }} />
-                  <div style={{ fontSize: 28, marginBottom: 10 }}>🎬</div>
-                  <h3 style={{ fontSize: 15, fontWeight: 700, marginBottom: 5, letterSpacing: "-0.3px" }}>One-Click MP4 Export</h3>
-                  <p style={{ fontSize: 12, color: T.textDim, lineHeight: 1.5, margin: 0 }}>
-                    Compile all clips into a single download-ready MP4. Plus CSV, SRT, EDL, FCPXML and 4 more formats.
-                  </p>
-                  <div style={{
-                    marginTop: 12, display: "inline-block", fontSize: 10, fontWeight: 600,
-                    color: T.accent, background: "rgba(0,229,160,0.08)",
-                    padding: "3px 10px", borderRadius: 5, border: "1px solid rgba(0,229,160,0.1)",
-                  }}>8 export formats</div>
-                </div>
-              </div>
-            </div>
-
             {/* Trust strip */}
             <div style={{
               display: "flex", justifyContent: "center", gap: 28, marginTop: 36,
-              animation: "fadeIn 0.8s ease-out 0.7s both",
+              animation: "fadeIn 0.8s ease-out 0.4s both",
             }}>
               {[
                 { icon: "🔒", text: "Runs in your browser" },
-                { icon: "⚡", text: "No downloads needed" },
-                { icon: "📱", text: "TikTok / Reels / Shorts ready" },
+                { icon: "⚡", text: "AI-powered analysis" },
+                { icon: "🎬", text: "FFmpeg export ready" },
               ].map((item, i) => (
                 <div key={i} style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontSize: 14 }}>{item.icon}</span>
@@ -1734,82 +1179,13 @@ export default function ClipForge() {
         {/* ===== STEP 1: TRANSCRIPT ===== */}
         {step === 1 && (
           <div style={{ animation: "fadeUp 0.5s ease-out" }}>
-            <h2 style={{ fontSize: 28, fontWeight: 800, marginBottom: 6, letterSpacing: "-0.5px" }}>Get your transcript</h2>
-            <p style={{ color: T.textMid, fontSize: 15, marginBottom: 20, lineHeight: 1.5 }}>
-              Choose how to provide the transcript for AI analysis.
+            <h2 style={{ fontSize: 28, fontWeight: 800, marginBottom: 6, letterSpacing: "-0.5px" }}>Paste transcript</h2>
+            <p style={{ color: T.textMid, fontSize: 15, marginBottom: 8, lineHeight: 1.5 }}>
+              Include timestamps if available — it helps the AI place clips more accurately.
             </p>
-
-            {/* Auto-transcribe card */}
-            {videoFile && (
-              <TiltCard style={{ padding: 20, marginBottom: 20 }}>
-                <div style={{ position: "relative", zIndex: 3 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 6 }}>
-                    <span style={{ fontSize: 20 }}>🎤</span>
-                    <h3 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Auto-Transcribe</h3>
-                    <span style={{
-                      fontSize: 9, fontWeight: 700, letterSpacing: "0.8px",
-                      background: "linear-gradient(135deg, #00E5A0, #00C488)", color: "#111118",
-                      padding: "2px 8px", borderRadius: 4,
-                    }}>RECOMMENDED</span>
-                  </div>
-                  <p style={{ fontSize: 12, color: T.textDim, marginBottom: 14 }}>
-                    AI automatically extracts and transcribes audio from your video with timestamps. Powered by OpenAI Whisper.
-                  </p>
-
-                  {isTranscribeLimited ? (
-                    <div style={{
-                      background: "rgba(140,120,255,0.06)", border: "1px solid rgba(140,120,255,0.15)",
-                      borderRadius: 10, padding: "14px 18px",
-                      display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12,
-                    }}>
-                      <div>
-                        <div style={{ fontSize: 14, fontWeight: 600, color: T.text, marginBottom: 3 }}>
-                          Free transcription used
-                        </div>
-                        <div style={{ fontSize: 12, color: T.textDim }}>
-                          Upgrade to Pro for unlimited auto-transcription, or paste a transcript manually below.
-                        </div>
-                      </div>
-                      <button className="btn-primary" onClick={() => setShowPricing(true)} style={{ flexShrink: 0, padding: "8px 18px", fontSize: 13 }}>
-                        Upgrade →
-                      </button>
-                    </div>
-                  ) : (
-                    <>
-                      <button className="btn-primary" onClick={autoTranscribe}
-                        disabled={transcribing}
-                        style={{ fontSize: 15, padding: "14px 28px", width: "100%" }}>
-                        {transcribing ? (
-                          <span style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center" }}>
-                            <span style={{
-                              width: 14, height: 14, border: "2px solid rgba(0,229,160,0.3)",
-                              borderTopColor: "#00E5A0", borderRadius: "50%",
-                              animation: "spin 0.9s linear infinite", flexShrink: 0,
-                            }} />
-                            {transcribeProgress}
-                          </span>
-                        ) : "🎤 Auto-Transcribe Video"}
-                      </button>
-                      {!transcribing && (
-                        <p style={{ fontSize: 11, color: T.textDim, marginTop: 8 }}>
-                          ⚡ Takes 30-90 seconds depending on video length.
-                          {plan === "free" && <span style={{ color: T.accentAlt }}> · {FREE_TRANSCRIBE_LIMIT - transcribeUsage} free transcription{FREE_TRANSCRIBE_LIMIT - transcribeUsage !== 1 ? "s" : ""} remaining</span>}
-                        </p>
-                      )}
-                    </>
-                  )}
-                </div>
-              </TiltCard>
-            )}
-
-            {/* Divider */}
-            {videoFile && (
-              <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 20 }}>
-                <div style={{ flex: 1, height: 1, background: "rgba(160,160,255,0.1)" }} />
-                <span style={{ fontSize: 12, color: T.textDim, fontWeight: 500 }}>or paste manually</span>
-                <div style={{ flex: 1, height: 1, background: "rgba(160,160,255,0.1)" }} />
-              </div>
-            )}
+            <p style={{ color: T.textDim, fontSize: 12, marginBottom: 20 }}>
+              💡 Get YouTube transcripts from the video → "Show transcript", or use otter.ai for uploaded videos.
+            </p>
 
             <div style={{ marginBottom: 14, display: "flex", gap: 10, alignItems: "center" }}>
               <span style={{ fontSize: 12, color: T.textDim, fontWeight: 500 }}>Video duration:</span>
@@ -1822,19 +1198,18 @@ export default function ClipForge() {
             <textarea value={transcript} onChange={(e) => setTranscript(e.target.value)}
               placeholder={`Paste your transcript here...\n\nExample:\n0:00 - Welcome to today's video...\n0:45 - The first thing you need to know...\n2:30 - Here's where it gets interesting...`}
               style={{
-                width: "100%", minHeight: 260, padding: 18, borderRadius: 12,
-                border: `1px solid ${transcript ? "rgba(0,229,160,0.2)" : "rgba(160,160,255,0.1)"}`,
-                background: "rgba(26,26,36,0.6)",
+                width: "100%", minHeight: 300, padding: 18, borderRadius: 12,
+                border: "1px solid rgba(160,160,255,0.1)", background: "rgba(26,26,36,0.6)",
                 backdropFilter: "blur(12px)", color: T.text,
                 fontSize: 13, fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.7,
                 resize: "vertical", outline: "none",
                 transition: "border-color 0.3s, box-shadow 0.3s",
               }}
               onFocus={(e) => { e.target.style.borderColor = "rgba(0,229,160,0.3)"; e.target.style.boxShadow = "0 0 0 3px rgba(0,229,160,0.06)"; }}
-              onBlur={(e) => { e.target.style.borderColor = transcript ? "rgba(0,229,160,0.2)" : "rgba(160,160,255,0.1)"; e.target.style.boxShadow = "none"; }}
+              onBlur={(e) => { e.target.style.borderColor = "rgba(160,160,255,0.1)"; e.target.style.boxShadow = "none"; }}
             />
             <div style={{ fontSize: 11, color: T.textDim, marginTop: 6, marginBottom: 20, fontFamily: "'JetBrains Mono', monospace" }}>
-              {transcript.length.toLocaleString()} characters {transcript && "✓"}
+              {transcript.length.toLocaleString()} characters
             </div>
 
             {error && (
@@ -2067,335 +1442,41 @@ export default function ClipForge() {
 
             {/* Export */}
             <TiltCard style={{ padding: 24 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 6 }}>
-                <span style={{ fontSize: 20 }}>📤</span>
-                <h3 style={{ fontSize: 18, fontWeight: 700, margin: 0, letterSpacing: "-0.3px" }}>Export</h3>
+              <h3 style={{ fontSize: 18, fontWeight: 700, marginBottom: 14, letterSpacing: "-0.3px" }}>Export</h3>
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+                <button className="btn-primary" onClick={exportClipData} disabled={selectedClips.length === 0}>
+                  📋 Export JSON
+                </button>
+                <button className="btn-secondary" onClick={() => setShowFFmpeg(!showFFmpeg)} disabled={selectedClips.length === 0}>
+                  🎬 {showFFmpeg ? "Hide" : "Show"} FFmpeg
+                </button>
+                <button className="btn-secondary" onClick={() => {
+                  const t = selectedClips.map((c, i) => `Clip ${i + 1}: ${formatTime(c.start)} → ${formatTime(c.end)} | ${CATEGORIES[c.category]?.label || c.category} | ${c.reason}`).join("\n");
+                  navigator.clipboard?.writeText(t);
+                }} disabled={selectedClips.length === 0}>
+                  📝 Copy Summary
+                </button>
               </div>
-              <p style={{ fontSize: 12, color: T.textDim, marginBottom: 20 }}>
-                {selectedClips.length} clip{selectedClips.length !== 1 ? "s" : ""} selected · {formatTime(totalClipDuration)} total
-              </p>
-
-              {/* ===== PRIMARY: MP4 Video Compilation ===== */}
-              <div style={{
-                background: "rgba(0,229,160,0.04)", border: "1.5px solid rgba(0,229,160,0.15)",
-                borderRadius: 14, padding: 20, marginBottom: 20,
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 4 }}>
-                  <span style={{ fontSize: 22 }}>🎬</span>
-                  <h4 style={{ fontSize: 16, fontWeight: 700, margin: 0, letterSpacing: "-0.3px" }}>MP4 Video</h4>
-                  <span style={{
-                    fontSize: 9, fontWeight: 700, letterSpacing: "0.8px",
-                    background: "linear-gradient(135deg, #00E5A0, #00C488)", color: "#111118",
-                    padding: "2px 8px", borderRadius: 4,
-                  }}>RECOMMENDED</span>
-                  {videoSource === "youtube" && (
-                    <span style={{
-                      fontSize: 10, color: "#E0976A", background: "rgba(255,180,100,0.08)",
-                      padding: "3px 8px", borderRadius: 5, border: "1px solid rgba(255,180,100,0.1)",
-                      fontWeight: 600,
-                    }}>Upload only</span>
-                  )}
-                </div>
-                <p style={{ fontSize: 12, color: T.textDim, marginBottom: 16 }}>
-                  Compile selected clips into a single downloadable video with transitions
-                </p>
-
-                {videoSource === "youtube" ? (
-                  <div style={{
-                    background: "rgba(255,180,100,0.05)", border: "1px solid rgba(255,180,100,0.12)",
-                    borderRadius: 10, padding: 16,
+              {showFFmpeg && (
+                <div style={{ animation: "fadeUp 0.3s ease-out" }}>
+                  <p style={{ fontSize: 12, color: T.textDim, marginBottom: 10 }}>
+                    Terminal commands to extract clips. Requires{" "}
+                    <a href="https://ffmpeg.org" target="_blank" rel="noreferrer" style={{ color: T.accent, textDecoration: "none", borderBottom: `1px solid ${T.accent}40` }}>FFmpeg</a>.
+                  </p>
+                  <pre style={{
+                    background: "rgba(17,17,24,0.8)", border: "1px solid rgba(160,160,255,0.06)",
+                    borderRadius: 10, padding: 16, fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
+                    color: T.accent, overflowX: "auto", lineHeight: 1.9, whiteSpace: "pre-wrap",
                   }}>
-                    <p style={{ fontSize: 13, color: "#E0976A", marginBottom: 8, fontWeight: 500 }}>
-                      ⚠️ Browser compilation isn't available for YouTube videos due to download restrictions.
-                    </p>
-                    <p style={{ fontSize: 12, color: T.textDim, marginBottom: 12, lineHeight: 1.5 }}>
-                      Download the video first using{" "}
-                      <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noreferrer" style={{ color: T.accent, textDecoration: "none", borderBottom: `1px solid ${T.accent}40` }}>yt-dlp</a>,
-                      then re-upload it here to compile. Or use the terminal commands below.
-                    </p>
-                    <pre style={{
-                      background: "rgba(17,17,24,0.8)", border: "1px solid rgba(160,160,255,0.06)",
-                      borderRadius: 8, padding: 12, fontSize: 11, fontFamily: "'JetBrains Mono', monospace",
-                      color: T.accent, whiteSpace: "pre-wrap", lineHeight: 1.8,
-                    }}>
-                      {`# Download the video first:\nyt-dlp -f mp4 "${youtubeUrl}" -o input.mp4\n\n# Then compile all clips into one video:\n${selectedClips.map((c, i) => `ffmpeg -i input.mp4 -ss ${c.start} -to ${c.end} -c copy clip_${String(i + 1).padStart(2, "0")}.mp4`).join("\n")}\n\n# Merge into compilation:\nffmpeg -f concat -safe 0 -i <(printf "file '%s'\\n" clip_*.mp4) -c copy compilation.mp4`}
-                    </pre>
-                    <button className="btn-ghost" onClick={() => {
-                      const cmd = `yt-dlp -f mp4 "${youtubeUrl}" -o input.mp4\n\n${selectedClips.map((c, i) => `ffmpeg -i input.mp4 -ss ${c.start} -to ${c.end} -c copy clip_${String(i + 1).padStart(2, "0")}.mp4`).join("\n")}\n\nffmpeg -f concat -safe 0 -i <(printf "file '%s'\\n" clip_*.mp4) -c copy compilation.mp4`;
-                      navigator.clipboard?.writeText(cmd);
-                    }} style={{ marginTop: 8 }}>
-                      Copy full command
-                    </button>
-                  </div>
-                ) : (
-                  <div>
-                    {/* Transition picker */}
-                    <div style={{ marginBottom: 16 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: T.text }}>Transition Style</span>
-                        <span style={{ fontSize: 11, color: T.textDim }}>
-                          {transition !== "none" ? "Adds ~0.5s between clips" : "Instant switch"}
-                        </span>
-                      </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6 }}>
-                        {Object.entries(TRANSITIONS).map(([key, t]) => {
-                          const isActive = transition === key;
-                          return (
-                            <button key={key} onClick={() => { setTransition(key); setCompiledUrl(null); }} style={{
-                              padding: "10px 6px", borderRadius: 10, cursor: "pointer",
-                              border: `1.5px solid ${isActive ? "rgba(0,229,160,0.5)" : "rgba(160,160,255,0.08)"}`,
-                              background: isActive ? "rgba(0,229,160,0.1)" : "rgba(26,26,36,0.5)",
-                              display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
-                              transition: "all 0.2s ease", fontFamily: "'Outfit', sans-serif",
-                            }}>
-                              <span style={{ fontSize: 18 }}>{t.icon}</span>
-                              <span style={{
-                                fontSize: 10, fontWeight: 600, letterSpacing: "-0.2px",
-                                color: isActive ? "#00E5A0" : T.textMid,
-                              }}>{t.label}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                      <p style={{ fontSize: 11, color: T.textDim, marginTop: 6 }}>
-                        {TRANSITIONS[transition]?.desc}
-                        {transition !== "none" && " · Requires re-encoding (slower but looks pro)"}
-                      </p>
-                    </div>
-
-                    {/* Aspect Ratio picker */}
-                    <div style={{ marginBottom: 16 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: T.text }}>Aspect Ratio</span>
-                      </div>
-                      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
-                        {Object.entries(ASPECT_RATIOS).map(([key, ar]) => {
-                          const isActive = aspectRatio === key;
-                          const previewW = key === "9:16" ? 28 : key === "1:1" ? 38 : 52;
-                          const previewH = key === "9:16" ? 50 : key === "1:1" ? 38 : 30;
-                          return (
-                            <button key={key} onClick={() => { setAspectRatio(key); setCompiledUrl(null); }} style={{
-                              padding: "12px 8px", borderRadius: 10, cursor: "pointer",
-                              border: `1.5px solid ${isActive ? "rgba(0,229,160,0.5)" : "rgba(160,160,255,0.08)"}`,
-                              background: isActive ? "rgba(0,229,160,0.1)" : "rgba(26,26,36,0.5)",
-                              display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
-                              transition: "all 0.2s ease", fontFamily: "'Outfit', sans-serif",
-                            }}>
-                              <div style={{
-                                width: previewW, height: previewH, borderRadius: 4,
-                                border: `2px solid ${isActive ? "#00E5A0" : T.textDim}`,
-                                transition: "all 0.2s ease",
-                              }} />
-                              <div style={{ textAlign: "center" }}>
-                                <div style={{ fontSize: 12, fontWeight: 700, color: isActive ? "#00E5A0" : T.text }}>{ar.label}</div>
-                                <div style={{ fontSize: 9, color: T.textDim }}>{ar.desc}</div>
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Captions toggle + style picker */}
-                    <div style={{ marginBottom: 18 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-                        <span style={{ fontSize: 13, fontWeight: 600, color: T.text }}>Captions</span>
-                        <button onClick={() => { setCaptionsEnabled(!captionsEnabled); setCompiledUrl(null); }} style={{
-                          width: 44, height: 24, borderRadius: 12, cursor: "pointer",
-                          background: captionsEnabled ? "#00E5A0" : "rgba(160,160,255,0.15)",
-                          border: "none", position: "relative", transition: "background 0.3s ease",
-                          flexShrink: 0,
-                        }}>
-                          <div style={{
-                            width: 18, height: 18, borderRadius: "50%", background: "white",
-                            position: "absolute", top: 3,
-                            left: captionsEnabled ? 23 : 3,
-                            transition: "left 0.3s ease",
-                            boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-                          }} />
-                        </button>
-                        <span style={{ fontSize: 11, color: T.textDim }}>
-                          {captionsEnabled ? "Burn captions onto video" : "No captions"}
-                        </span>
-                      </div>
-
-                      {captionsEnabled && (
-                        <div style={{ animation: "fadeUp 0.3s ease-out" }}>
-                          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 6 }}>
-                            {Object.entries(CAPTION_STYLES).map(([key, s]) => {
-                              const isActive = captionStyle === key;
-                              return (
-                                <button key={key} onClick={() => { setCaptionStyle(key); setCompiledUrl(null); }} style={{
-                                  padding: "10px 6px", borderRadius: 10, cursor: "pointer",
-                                  border: `1.5px solid ${isActive ? "rgba(140,120,255,0.5)" : "rgba(160,160,255,0.08)"}`,
-                                  background: isActive ? "rgba(140,120,255,0.1)" : "rgba(26,26,36,0.5)",
-                                  display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
-                                  transition: "all 0.2s ease", fontFamily: "'Outfit', sans-serif",
-                                }}>
-                                  <span style={{ fontSize: 16 }}>{s.icon}</span>
-                                  <span style={{
-                                    fontSize: 10, fontWeight: 600,
-                                    color: isActive ? T.accentAlt : T.textMid,
-                                  }}>{s.label}</span>
-                                </button>
-                              );
-                            })}
-                          </div>
-                          <p style={{ fontSize: 11, color: T.textDim, marginTop: 6 }}>
-                            {CAPTION_STYLES[captionStyle]?.desc} · Uses each clip's key quote
-                          </p>
-                        </div>
-                      )}
-                    </div>
-                    {!compiledUrl && (
-                      <button
-                        className="btn-primary"
-                        onClick={compileVideo}
-                        disabled={compiling || selectedClips.length === 0}
-                        style={{ fontSize: 15, padding: "14px 28px", width: "100%" }}
-                      >
-                        {compiling ? (
-                          <span style={{ display: "flex", alignItems: "center", gap: 8, justifyContent: "center" }}>
-                            <span style={{
-                              width: 14, height: 14, border: "2px solid rgba(0,229,160,0.3)",
-                              borderTopColor: "#00E5A0", borderRadius: "50%",
-                              animation: "spin 0.9s linear infinite", flexShrink: 0,
-                            }} />
-                            {compileProgress}
-                          </span>
-                        ) : (
-                          <>{TRANSITIONS[transition]?.icon} Export {aspectRatio === "9:16" ? "Vertical" : aspectRatio === "1:1" ? "Square" : ""} MP4 {transition !== "none" ? `· ${TRANSITIONS[transition]?.label}` : "· Hard Cut"}{captionsEnabled ? " · Captions" : ""}</>
-                        )}
-                      </button>
-                    )}
-
-                    {/* Progress bar */}
-                    {compiling && (
-                      <div style={{
-                        marginTop: 12, background: "rgba(26,26,36,0.6)",
-                        borderRadius: 8, overflow: "hidden", height: 4,
-                      }}>
-                        <div style={{
-                          height: "100%", background: `linear-gradient(90deg, ${T.accent}, ${T.accentAlt})`,
-                          borderRadius: 8, width: "100%",
-                          animation: "shimmer 1.5s ease-in-out infinite",
-                          backgroundSize: "200% 100%",
-                          backgroundImage: `linear-gradient(90deg, ${T.accent}40, ${T.accent}, ${T.accent}40)`,
-                        }} />
-                      </div>
-                    )}
-
-                    {/* Result: compiled video */}
-                    {compiledUrl && (
-                      <div style={{ animation: "fadeUp 0.4s ease-out" }}>
-                        <div style={{
-                          background: "rgba(0,229,160,0.05)", border: "1px solid rgba(0,229,160,0.15)",
-                          borderRadius: 12, padding: 16, marginBottom: 14,
-                          display: "flex", alignItems: "center", gap: 10,
-                        }}>
-                          <span style={{
-                            width: 28, height: 28, borderRadius: "50%",
-                            background: "rgba(0,229,160,0.15)",
-                            display: "flex", alignItems: "center", justifyContent: "center",
-                            fontSize: 14,
-                          }}>✓</span>
-                          <div>
-                            <span style={{ fontSize: 14, fontWeight: 600, color: T.accent }}>Compilation ready!</span>
-                            <span style={{ fontSize: 12, color: T.textDim, marginLeft: 8 }}>
-                              {selectedClips.length} clips · {formatTime(totalClipDuration)}
-                            </span>
-                          </div>
-                        </div>
-
-                        <video
-                          src={compiledUrl}
-                          controls
-                          style={{
-                            width: "100%", borderRadius: 12, marginBottom: 14,
-                            boxShadow: "0 4px 24px rgba(0,0,0,0.4)",
-                            border: "1px solid rgba(0,229,160,0.15)",
-                          }}
-                        />
-
-                        <div style={{ display: "flex", gap: 10 }}>
-                          <a href={compiledUrl} download="clipforge-compilation.mp4"
-                            className="btn-primary" style={{ textDecoration: "none", fontSize: 15, padding: "14px 28px", flex: 1, justifyContent: "center" }}>
-                            ⬇ Download MP4
-                          </a>
-                          <button className="btn-secondary" onClick={() => {
-                            setCompiledUrl(null);
-                            setCompileProgress("");
-                          }} style={{ fontSize: 13 }}>
-                            ↻ Re-compile
-                          </button>
-                        </div>
-                      </div>
-                    )}
-
-                    {!compiling && !compiledUrl && (
-                      <p style={{ fontSize: 11, color: T.textDim, marginTop: 10 }}>
-                        ⚡ First compile loads the video processor (~30s). {transition !== "none" ? "Transitions require re-encoding which takes longer but produces pro results." : "Hard cut mode is fastest."}
-                      </p>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* ===== SECONDARY: Other Export Formats ===== */}
-              <div style={{
-                borderTop: "1px solid rgba(160,160,255,0.08)",
-                paddingTop: 18,
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
-                  <span style={{ fontSize: 14 }}>📎</span>
-                  <span style={{ fontSize: 14, fontWeight: 600, color: T.textMid }}>Also export as...</span>
-                </div>
-
-                {/* Format grid */}
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginBottom: 14 }}>
-                  {EXPORT_FORMATS.map((fmt) => (
-                    <button key={fmt.id} className="btn-secondary" onClick={fmt.fn}
-                      disabled={selectedClips.length === 0}
-                      style={{
-                        padding: "10px 6px", fontSize: 12, flexDirection: "column", gap: 3,
-                        display: "flex", alignItems: "center", justifyContent: "center",
-                      }}>
-                      <span style={{ fontSize: 16 }}>{fmt.icon}</span>
-                      <span style={{ fontWeight: 600, fontSize: 10 }}>{fmt.label}</span>
-                      <span style={{ fontSize: 9, color: T.textDim, textAlign: "center", lineHeight: 1.2 }}>{fmt.desc}</span>
-                    </button>
-                  ))}
-                </div>
-
-                {/* Quick actions */}
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button className="btn-secondary" onClick={() => {
-                    const t = selectedClips.map((c, i) => `Clip ${i + 1}: ${formatTime(c.start)} → ${formatTime(c.end)} | ${CATEGORIES[c.category]?.label || c.category} | ${c.reason}`).join("\n");
-                    navigator.clipboard?.writeText(t);
-                  }} disabled={selectedClips.length === 0} style={{ fontSize: 12 }}>
-                    📋 Copy to Clipboard
-                  </button>
-                  <button className="btn-secondary" onClick={() => setShowFFmpeg(!showFFmpeg)} disabled={selectedClips.length === 0} style={{ fontSize: 12 }}>
-                    ⌨️ {showFFmpeg ? "Hide" : "Show"} FFmpeg Commands
+                    {generateFFmpegCommands()}
+                    {"\n\n# Concatenate all clips:\n"}
+                    {`ffmpeg -f concat -safe 0 -i <(printf "file '%s'\\n" clip_*.mp4) -c copy final_compilation.mp4`}
+                  </pre>
+                  <button className="btn-ghost" onClick={() => navigator.clipboard?.writeText(generateFFmpegCommands())} style={{ marginTop: 8 }}>
+                    Copy commands
                   </button>
                 </div>
-                {showFFmpeg && (
-                  <div style={{ animation: "fadeUp 0.3s ease-out", marginTop: 12 }}>
-                    <pre style={{
-                      background: "rgba(17,17,24,0.8)", border: "1px solid rgba(160,160,255,0.06)",
-                      borderRadius: 10, padding: 16, fontSize: 12, fontFamily: "'JetBrains Mono', monospace",
-                      color: T.accent, overflowX: "auto", lineHeight: 1.9, whiteSpace: "pre-wrap",
-                    }}>
-                      {generateFFmpegCommands()}
-                      {"\n\n# Concatenate all clips:\n"}
-                      {`ffmpeg -f concat -safe 0 -i <(printf "file '%s'\\n" clip_*.mp4) -c copy final_compilation.mp4`}
-                    </pre>
-                    <button className="btn-ghost" onClick={() => navigator.clipboard?.writeText(generateFFmpegCommands())} style={{ marginTop: 8 }}>
-                      Copy commands
-                    </button>
-                  </div>
-                )}
-              </div>
+              )}
             </TiltCard>
           </div>
         )}
